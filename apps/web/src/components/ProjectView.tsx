@@ -73,6 +73,7 @@ import {
   type ByokMediaDefaults,
   type ByokChatProtocol,
   type ChatTaskExecutionAnalytics,
+  type ExtractMemoryRequest,
   type MemorySystemPromptResponse,
   type ProjectWorkspaceScope,
   type ResearchOptions,
@@ -1755,22 +1756,33 @@ function isOpenCodeByokChatProtocol(
   );
 }
 
-type ByokMemoryChatProvider = {
-  provider: ByokChatProtocol;
-  apiKey: string;
-  baseUrl: string;
-  apiVersion: string;
-  model: string;
-};
+type ByokMemoryChatProvider = NonNullable<ExtractMemoryRequest['chatProvider']>;
+
+function memoryExtractionProviderForByokProtocol(
+  protocol: AppConfig['apiProtocol'],
+): ByokMemoryChatProvider['provider'] | undefined {
+  switch (protocol) {
+    case 'anthropic':
+    case 'openai':
+    case 'azure':
+    case 'google':
+    case 'ollama':
+      return protocol;
+    default:
+      // The chat picker has protocols the memory daemon does not consume.
+      return undefined;
+  }
+}
 
 function byokMemoryChatProviderFromConfig(
   config: AppConfig,
 ): ByokMemoryChatProvider | undefined {
-  if (!isOpenCodeByokChatProtocol(config.apiProtocol) || !config.apiKey) {
+  const provider = memoryExtractionProviderForByokProtocol(config.apiProtocol);
+  if (!provider || !config.apiKey) {
     return undefined;
   }
   return {
-    provider: config.apiProtocol,
+    provider,
     apiKey: config.apiKey,
     baseUrl: config.baseUrl,
     apiVersion: config.apiProtocol === 'azure' ? config.apiVersion ?? '' : '',
@@ -1781,9 +1793,12 @@ function byokMemoryChatProviderFromConfig(
 function byokMemoryChatProviderFromOpenCodeProvider(
   provider: ByokChatProviderConfig | undefined,
 ): ByokMemoryChatProvider | undefined {
-  if (!provider) return undefined;
+  const memoryProvider = provider
+    ? memoryExtractionProviderForByokProtocol(provider.protocol)
+    : undefined;
+  if (!provider || !memoryProvider) return undefined;
   return {
-    provider: provider.protocol,
+    provider: memoryProvider,
     apiKey: provider.apiKey,
     baseUrl: provider.baseUrl ?? '',
     apiVersion: provider.apiVersion ?? '',
@@ -1800,16 +1815,17 @@ async function postByokMemoryExtraction(input: {
 }): Promise<void> {
   if (input.userMessage.length === 0) return;
   try {
+    const request = {
+      userMessage: input.userMessage,
+      ...(input.assistantMessage ? { assistantMessage: input.assistantMessage } : {}),
+      projectId: input.projectId,
+      conversationId: input.conversationId,
+      ...(input.chatProvider ? { chatProvider: input.chatProvider } : {}),
+    } satisfies ExtractMemoryRequest;
     await fetch('/api/memory/extract', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        userMessage: input.userMessage,
-        ...(input.assistantMessage ? { assistantMessage: input.assistantMessage } : {}),
-        projectId: input.projectId,
-        conversationId: input.conversationId,
-        chatProvider: input.chatProvider,
-      }),
+      body: JSON.stringify(request),
     });
   } catch {
     // Memory extraction is best-effort and must never block a chat run.
