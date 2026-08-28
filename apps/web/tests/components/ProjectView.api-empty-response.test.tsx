@@ -5,6 +5,7 @@ import { useLayoutEffect, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ProjectView } from '../../src/components/ProjectView';
+import { streamMessage } from '../../src/providers/anthropic';
 import { streamViaDaemon } from '../../src/providers/daemon';
 import type { DaemonStreamOptions } from '../../src/providers/daemon';
 import {
@@ -232,6 +233,7 @@ vi.mock('../../src/components/ChatPane', () => ({
 }));
 
 const mockedStreamViaDaemon = vi.mocked(streamViaDaemon);
+const mockedStreamMessage = vi.mocked(streamMessage);
 const mockedFetchProjectFilePreview = vi.mocked(fetchProjectFilePreview);
 const mockedFetchProjectFileText = vi.mocked(fetchProjectFileText);
 const mockedFetchProjectFiles = vi.mocked(fetchProjectFiles);
@@ -310,6 +312,7 @@ describe('ProjectView API empty response handling', () => {
     chatPaneMockState.fireResizeObserverOnFocusedLayout = false;
     chatPaneMockState.resizeObserverCallbacks = [];
     mockedStreamViaDaemon.mockReset();
+    mockedStreamMessage.mockReset();
     mockedFetchProjectFilePreview.mockReset();
     mockedFetchProjectFileText.mockReset();
     mockedFetchProjectFiles.mockReset();
@@ -613,9 +616,13 @@ describe('ProjectView API empty response handling', () => {
     expect(userMessage?.content).toContain('Second line');
   });
 
-  it('fails BYOK API sends before daemon routing when OpenCode is unavailable', async () => {
+  it('routes pure BYOK API sends without requiring OpenCode', async () => {
     const fetchMock = vi.fn(async () => Response.json({}));
     vi.stubGlobal('fetch', fetchMock);
+    mockedStreamMessage.mockImplementation(async (_config, _system, _history, _signal, handlers) => {
+      handlers.onDelta('hello');
+      handlers.onDone('hello');
+    });
     renderProjectView(project, [
       {
         id: 'byok-opencode',
@@ -628,14 +635,9 @@ describe('ProjectView API empty response handling', () => {
 
     await sendTestPrompt();
 
-    await waitFor(() =>
-      expect(screen.getAllByText(/BYOK API runs require OpenCode/i).length).toBeGreaterThan(0),
-    );
+    await waitFor(() => expect(mockedStreamMessage).toHaveBeenCalledTimes(1));
     expect(mockedStreamViaDaemon).not.toHaveBeenCalled();
-    expect(fetchMock).not.toHaveBeenCalledWith(
-      '/api/memory/extract',
-      expect.any(Object),
-    );
+    expect(screen.queryByText(/BYOK API runs require OpenCode/i)).toBeNull();
   });
 
   it('does not include saved project instructions in the BYOK system prompt', async () => {
