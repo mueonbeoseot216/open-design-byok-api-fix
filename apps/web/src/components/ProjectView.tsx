@@ -1859,6 +1859,7 @@ async function streamDirectByokRun(input: {
 }): Promise<void> {
   let accumulatedAssistantText = '';
   let terminal: { result: DirectByokRunResult; text: string } | null = null;
+  let terminalCallbackPromise: Promise<void> | undefined;
   let analyticsFinished = false;
 
   const emitRunFinished = (
@@ -1895,7 +1896,7 @@ async function streamDirectByokRun(input: {
       result: text.trim().length > 0 ? 'success' : 'failed',
       text,
     };
-    input.handlers.onDone(text);
+    terminalCallbackPromise = Promise.resolve(input.handlers.onDone(text));
   };
 
   const acceptError = (error: Error): void => {
@@ -1950,6 +1951,7 @@ async function streamDirectByokRun(input: {
   }
 
   if (!terminal) return;
+  await terminalCallbackPromise?.catch(() => undefined);
   if (terminal.result === 'success') {
     const artifactCount = await input.countProducedArtifacts().catch(() => 0);
     emitRunFinished('success', artifactCount);
@@ -8007,7 +8009,7 @@ export function ProjectView({
             },
           }));
         },
-        onDone: (fullText = '') => {
+        onDone: async (fullText = '') => {
           // The daemon delivers onDone even for a canceled run, so a run
           // superseded by a "send now" interrupt can still land here and must
           // not apply its completion side effects over the replacement. A run
@@ -8102,7 +8104,7 @@ export function ProjectView({
           // refresh signal) so we can diff against the pre-turn snapshot
           // and attach the new files to the assistant message as download
           // chips.
-          void (async () => {
+          await (async () => {
             try {
               // A settled shared file-list read from before the daemon exit can
               // otherwise win the race with the file-change invalidation and
@@ -8796,7 +8798,7 @@ export function ProjectView({
             runBase: byokRunBase,
             startedAt,
             countProducedArtifacts: async () => {
-              const files = await refreshProjectFiles();
+              const files = await refreshProjectFiles({ fresh: true });
               return (computeProducedFiles(beforeFileNames, files) ?? []).filter(
                 (file) => Boolean(file.artifactManifest),
               ).length;
