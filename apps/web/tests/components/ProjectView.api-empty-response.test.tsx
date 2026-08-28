@@ -29,6 +29,7 @@ import type {
   Conversation,
   DesignSystemSummary,
   Project,
+  ProjectFile,
   SkillSummary,
 } from '../../src/types';
 import { workspaceContextFixture } from '../helpers/workspace-context';
@@ -944,6 +945,68 @@ describe('ProjectView API empty response handling', () => {
     await waitFor(() => expect(mockedTrackRunFinished).toHaveBeenCalledTimes(1));
     expect(mockedTrackRunFinished.mock.calls[0]?.[1]).toMatchObject({ result: 'success' });
     expect(screen.queryByText('late provider error')).toBeNull();
+  });
+
+  it('waits for direct API artifact persistence before publishing the artifact count', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
+    vi.stubGlobal('fetch', fetchMock);
+    const artifact =
+      '<artifact identifier="landing-page" type="text/html" title="Landing Page">' +
+      '<!doctype html><html><head><title>Landing</title></head><body><main><h1>Landing page</h1><p>Generated design artifact with enough structure to persist.</p></main></body></html>' +
+      '</artifact>';
+    const persistedArtifact: ProjectFile = {
+      name: 'landing-page.html',
+      path: 'landing-page.html',
+      kind: 'html',
+      mime: 'text/html',
+      size: 1,
+      mtime: 1,
+      artifactManifest: {
+        version: 1,
+        kind: 'html',
+        title: 'Landing Page',
+        entry: 'landing-page.html',
+        renderer: 'html',
+        exports: ['html'],
+        metadata: { identifier: 'landing-page', inferred: false },
+      },
+    };
+    let projectFiles: ProjectFile[] = [];
+    let releaseWrite: (() => void) | undefined;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    mockedFetchProjectFiles.mockImplementation(async () => projectFiles);
+    mockedWriteProjectTextFile.mockImplementation(async () => {
+      await writeGate;
+      projectFiles = [persistedArtifact];
+      return persistedArtifact;
+    });
+    mockedStreamMessage.mockImplementation(async (_config, _system, _history, _signal, handlers) => {
+      handlers.onDelta(artifact);
+      handlers.onDone('');
+    });
+    renderProjectView(project, [
+      {
+        id: 'byok-opencode',
+        name: 'BYOK OpenCode',
+        bin: 'opencode',
+        available: false,
+        models: [],
+      } as AgentInfo,
+    ]);
+
+    await sendTestPrompt();
+    await waitFor(() => expect(mockedWriteProjectTextFile).toHaveBeenCalledTimes(1));
+    expect(mockedTrackRunFinished).not.toHaveBeenCalled();
+
+    releaseWrite?.();
+
+    await waitFor(() => expect(mockedTrackRunFinished).toHaveBeenCalledTimes(1));
+    expect(mockedTrackRunFinished.mock.calls[0]?.[1]).toMatchObject({
+      result: 'success',
+      artifact_count: 1,
+    });
   });
 
   it('does not include saved project instructions in the BYOK system prompt', async () => {
