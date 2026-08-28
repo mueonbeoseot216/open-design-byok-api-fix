@@ -1879,8 +1879,17 @@ async function streamDirectByokRun(input: {
     );
   };
 
+  const acceptCancelled = (): void => {
+    if (terminal) return;
+    terminal = { result: 'cancelled', text: accumulatedAssistantText };
+  };
+
   const acceptDone = (fullText = ''): void => {
     if (terminal) return;
+    if (input.signal.aborted) {
+      acceptCancelled();
+      return;
+    }
     const text = fullText.trim().length > 0 ? fullText : accumulatedAssistantText;
     terminal = {
       result: text.trim().length > 0 ? 'success' : 'failed',
@@ -1891,31 +1900,40 @@ async function streamDirectByokRun(input: {
 
   const acceptError = (error: Error): void => {
     if (terminal) return;
-    const result = input.signal.aborted || error.name === 'AbortError'
-      ? 'cancelled'
-      : 'failed';
-    terminal = { result, text: accumulatedAssistantText };
-    if (result === 'failed') void input.handlers.onError(error);
+    if (input.signal.aborted || error.name === 'AbortError') {
+      acceptCancelled();
+      return;
+    }
+    terminal = { result: 'failed', text: accumulatedAssistantText };
+    void input.handlers.onError(error);
   };
 
   try {
-    await streamMessage(
-      input.config,
-      input.systemPrompt,
-      input.history,
-      input.signal,
-      {
-        onDelta: (delta) => {
-          if (terminal) return;
-          accumulatedAssistantText += delta;
-          input.handlers.onDelta(delta);
-          input.handlers.onAgentEvent({ kind: 'text', text: delta });
+    if (input.signal.aborted) {
+      acceptCancelled();
+    } else {
+      await streamMessage(
+        input.config,
+        input.systemPrompt,
+        input.history,
+        input.signal,
+        {
+          onDelta: (delta) => {
+            if (terminal) return;
+            if (input.signal.aborted) {
+              acceptCancelled();
+              return;
+            }
+            accumulatedAssistantText += delta;
+            input.handlers.onDelta(delta);
+            input.handlers.onAgentEvent({ kind: 'text', text: delta });
+          },
+          onDone: acceptDone,
+          onError: acceptError,
         },
-        onDone: acceptDone,
-        onError: acceptError,
-      },
-      input.context,
-    );
+        input.context,
+      );
+    }
   } catch (error) {
     acceptError(error instanceof Error ? error : new Error(String(error)));
   }
@@ -8785,6 +8803,7 @@ export function ProjectView({
             },
             context: {
               projectId: project.id,
+              workspaceContext: projectRunWorkspaceContext,
               byokImageModel:
                 byokImageModelOverride || config.byokImageModel || byokImageModelOptionsPV[0]?.id,
               byokVideoModel:
