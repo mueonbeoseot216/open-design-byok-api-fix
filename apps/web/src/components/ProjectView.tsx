@@ -19,7 +19,6 @@ import { validateHtmlArtifact } from '../artifacts/validate';
 import { recoverHtmlDocumentFromMarkdownFence, recoverStandaloneHtmlDocument, resolvePersistedArtifactHtml } from '../artifacts/recover';
 import { createArtifactParser } from '../artifacts/parser';
 import { useI18n } from '../i18n';
-import { streamMessage } from '../providers/anthropic';
 import {
   fetchChatRunStatus,
   GENERIC_DAEMON_DISCONNECT_CODE,
@@ -115,6 +114,7 @@ import {
   trackRunStartBlockedSurfaceView,
 } from '../analytics/events';
 import type { Track } from '../analytics/events';
+import type { ProxyContext } from '../providers/api-proxy';
 import {
   buildByokRunCreatedProps,
   buildByokRunFinishedProps,
@@ -1846,7 +1846,7 @@ async function streamDirectByokRun(input: {
   systemPrompt: string;
   history: ChatMessage[];
   signal: AbortSignal;
-  context?: Parameters<typeof streamMessage>[5];
+  context?: ProxyContext;
   handlers: DirectByokStreamHandlers;
   userText: string;
   projectId: string;
@@ -1913,6 +1913,7 @@ async function streamDirectByokRun(input: {
     if (input.signal.aborted) {
       acceptCancelled();
     } else {
+      const { streamMessage } = await import('../providers/anthropic');
       await streamMessage(
         input.config,
         input.systemPrompt,
