@@ -3,6 +3,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useLayoutEffect, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ProjectWorkspaceScope, WorkspaceCollabContext } from '@open-design/contracts';
 
 import { ProjectView } from '../../src/components/ProjectView';
 import { trackRunCreated, trackRunFinished } from '../../src/analytics/events';
@@ -30,6 +31,7 @@ import type {
   Project,
   SkillSummary,
 } from '../../src/types';
+import { workspaceContextFixture } from '../helpers/workspace-context';
 
 const chatPaneMockState = vi.hoisted(() => ({
   attachments: [] as ChatAttachment[],
@@ -44,6 +46,34 @@ vi.mock('../../src/router', () => ({
 
 vi.mock('../../src/providers/anthropic', () => ({
   streamMessage: vi.fn(),
+}));
+
+// Keep the collaboration writer gate outside these provider-routing tests.
+// The Team case below seeds an already-resolved project scope; this stub models
+// the separate status proof that lets its owner send a run.
+vi.mock('../../src/collab/useProjectCollab', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/collab/useProjectCollab')>()),
+  useProjectCollab: () => ({
+    enabled: false,
+    member: null,
+    present: [],
+    publishedVersion: null,
+    syncState: null,
+    viewerOnly: false,
+    writerAuthority: 'allowed' as const,
+    isOwner: false,
+    isEffectiveOwner: false,
+    isSharedNonOwner: false,
+    ownerDisplayName: null,
+    ownerRole: null,
+    downloadPending: false,
+    materializationPending: false,
+    reportChange: () => undefined,
+    requestPublish: () => undefined,
+    refreshPresence: () => undefined,
+    checkStatusNow: () => undefined,
+    applyContentTransferState: () => undefined,
+  }),
 }));
 
 vi.mock('../../src/analytics/events', async () => {
@@ -302,10 +332,16 @@ function renderProjectView(
     } as AgentInfo,
   ],
   renderConfig: AppConfig = config,
+  options: {
+    workspaceContextOverride?: WorkspaceCollabContext | null;
+    initialWorkspaceScope?: ProjectWorkspaceScope | null;
+  } = {},
 ) {
   return render(
     <ProjectView
       project={renderProject}
+      workspaceContextOverride={options.workspaceContextOverride}
+      initialWorkspaceScope={options.initialWorkspaceScope}
       routeFileName={null}
       config={renderConfig}
       agents={agents}
@@ -798,6 +834,93 @@ describe('ProjectView API empty response handling', () => {
     expect(screen.getByText('canceled')).toBeTruthy();
   });
 
+  it('keeps a direct API stop cancelled when the provider completes after abort', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
+    vi.stubGlobal('fetch', fetchMock);
+    let providerSignal: AbortSignal | undefined;
+    mockedStreamMessage.mockImplementation(async (_config, _system, _history, signal, handlers) => {
+      providerSignal = signal;
+      await new Promise<void>((resolve) => {
+        signal.addEventListener(
+          'abort',
+          () => {
+            handlers.onDone('late success');
+            resolve();
+          },
+          { once: true },
+        );
+      });
+    });
+    renderProjectView(project, [
+      {
+        id: 'byok-opencode',
+        name: 'BYOK OpenCode',
+        bin: 'opencode',
+        available: false,
+        models: [],
+      } as AgentInfo,
+    ]);
+
+    await sendTestPrompt();
+    await waitFor(() => expect(mockedStreamMessage).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole('button', { name: 'stop' }));
+
+    await waitFor(() => expect(providerSignal?.aborted).toBe(true));
+    await waitFor(() => expect(mockedTrackRunFinished).toHaveBeenCalledTimes(1));
+    expect(mockedTrackRunFinished.mock.calls[0]?.[1]).toMatchObject({
+      result: 'cancelled',
+      artifact_count: 0,
+    });
+    expect(screen.queryByText('late success')).toBeNull();
+    expect(screen.getByText('canceled')).toBeTruthy();
+  });
+
+  it('forwards the captured Team Workspace context to a direct API provider run', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
+    vi.stubGlobal('fetch', fetchMock);
+    const workspaceContext: WorkspaceCollabContext & { workspaceType: 'team' } = {
+      ...workspaceContextFixture({
+        workspaceId: 'team-workspace',
+        workspaceMemberId: 'team-member',
+      }),
+      workspaceType: 'team',
+    };
+    const teamProject = { ...project, workspaceId: workspaceContext.workspaceId };
+    const initialWorkspaceScope: ProjectWorkspaceScope = {
+      kind: 'team',
+      projectId: teamProject.id,
+      workspaceId: workspaceContext.workspaceId,
+      visibility: 'team',
+      context: workspaceContext,
+    };
+    mockedStreamMessage.mockImplementation(async (_config, _system, _history, _signal, handlers) => {
+      handlers.onDone('hello');
+    });
+    renderProjectView(
+      teamProject,
+      [
+        {
+          id: 'byok-opencode',
+          name: 'BYOK OpenCode',
+          bin: 'opencode',
+          available: false,
+          models: [],
+        } as AgentInfo,
+      ],
+      config,
+      { workspaceContextOverride: workspaceContext, initialWorkspaceScope },
+    );
+
+    await sendTestPrompt(teamProject.id, workspaceContext);
+
+    await waitFor(() => expect(mockedStreamMessage).toHaveBeenCalledTimes(1));
+    expect(mockedStreamMessage.mock.calls[0]?.[5]).toMatchObject({
+      projectId: teamProject.id,
+      workspaceContext,
+    });
+  });
+
   it('ignores a late provider callback after the direct API run is terminal', async () => {
     const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
     vi.stubGlobal('fetch', fetchMock);
@@ -1236,9 +1359,16 @@ describe('ProjectView API empty response handling', () => {
   });
 });
 
-async function sendTestPrompt() {
+async function sendTestPrompt(
+  expectedProjectId = project.id,
+  expectedWorkspaceContext: WorkspaceCollabContext | null = null,
+) {
   await waitFor(() => {
-    expect(mockedListMessages).toHaveBeenCalledWith(project.id, 'conv-project-1', null);
+    expect(mockedListMessages).toHaveBeenCalledWith(
+      expectedProjectId,
+      `conv-${expectedProjectId}`,
+      expectedWorkspaceContext,
+    );
   });
   await new Promise((resolve) => setTimeout(resolve, 0));
   await waitFor(() => expect(screen.getByRole('button', { name: 'send' })).toBeTruthy());
