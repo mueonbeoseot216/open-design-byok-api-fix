@@ -5,6 +5,7 @@ import { useLayoutEffect, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ProjectView } from '../../src/components/ProjectView';
+import { trackRunCreated, trackRunFinished } from '../../src/analytics/events';
 import { streamMessage } from '../../src/providers/anthropic';
 import { streamViaDaemon } from '../../src/providers/daemon';
 import type { DaemonStreamOptions } from '../../src/providers/daemon';
@@ -44,6 +45,17 @@ vi.mock('../../src/router', () => ({
 vi.mock('../../src/providers/anthropic', () => ({
   streamMessage: vi.fn(),
 }));
+
+vi.mock('../../src/analytics/events', async () => {
+  const actual = await vi.importActual<typeof import('../../src/analytics/events')>(
+    '../../src/analytics/events',
+  );
+  return {
+    ...actual,
+    trackRunCreated: vi.fn(),
+    trackRunFinished: vi.fn(),
+  };
+});
 
 vi.mock('../../src/providers/daemon', () => ({
   fetchChatRunStatus: vi.fn(),
@@ -165,6 +177,7 @@ vi.mock('../../src/components/ChatPane', () => ({
     messages,
     onSend,
     onRetry,
+    onStop,
     error,
     projectHeader,
     onCollapse,
@@ -177,6 +190,7 @@ vi.mock('../../src/components/ChatPane', () => ({
       commentAttachments: ChatCommentAttachment[],
     ) => void;
     onRetry?: (assistantMessage: ChatMessage) => void;
+    onStop?: () => void;
     error?: string | null;
     projectHeader?: ReactNode;
     onCollapse?: () => void;
@@ -207,6 +221,11 @@ vi.mock('../../src/components/ChatPane', () => ({
       >
         send
       </button>
+      {onStop ? (
+        <button type="button" onClick={onStop}>
+          stop
+        </button>
+      ) : null}
       {/* Mirrors the real ChatPane: when the collapse control is lifted into
           the tabs dock, the header slot renders nothing — otherwise two
           controls would share this testid. */}
@@ -234,6 +253,8 @@ vi.mock('../../src/components/ChatPane', () => ({
 
 const mockedStreamViaDaemon = vi.mocked(streamViaDaemon);
 const mockedStreamMessage = vi.mocked(streamMessage);
+const mockedTrackRunCreated = vi.mocked(trackRunCreated);
+const mockedTrackRunFinished = vi.mocked(trackRunFinished);
 const mockedFetchProjectFilePreview = vi.mocked(fetchProjectFilePreview);
 const mockedFetchProjectFileText = vi.mocked(fetchProjectFileText);
 const mockedFetchProjectFiles = vi.mocked(fetchProjectFiles);
@@ -313,6 +334,8 @@ describe('ProjectView API empty response handling', () => {
     chatPaneMockState.resizeObserverCallbacks = [];
     mockedStreamViaDaemon.mockReset();
     mockedStreamMessage.mockReset();
+    mockedTrackRunCreated.mockReset();
+    mockedTrackRunFinished.mockReset();
     mockedFetchProjectFilePreview.mockReset();
     mockedFetchProjectFileText.mockReset();
     mockedFetchProjectFiles.mockReset();
@@ -617,7 +640,7 @@ describe('ProjectView API empty response handling', () => {
   });
 
   it('routes pure BYOK API sends without requiring OpenCode', async () => {
-    const fetchMock = vi.fn(async () => Response.json({}));
+    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
     vi.stubGlobal('fetch', fetchMock);
     mockedStreamMessage.mockImplementation(async (_config, _system, _history, _signal, handlers) => {
       handlers.onDelta('hello');
@@ -638,6 +661,130 @@ describe('ProjectView API empty response handling', () => {
     await waitFor(() => expect(mockedStreamMessage).toHaveBeenCalledTimes(1));
     expect(mockedStreamViaDaemon).not.toHaveBeenCalled();
     expect(screen.queryByText(/BYOK API runs require OpenCode/i)).toBeNull();
+    expect(mockedTrackRunCreated).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(mockedTrackRunFinished).toHaveBeenCalledTimes(1));
+    const memoryRequests = fetchMock.mock.calls
+      .filter(([url]) => url === '/api/memory/extract')
+      .map(([, init]) => JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>);
+    expect(memoryRequests).toHaveLength(2);
+    expect(memoryRequests.every((request) => (
+      typeof request.chatProvider === 'object' &&
+      request.chatProvider !== null &&
+      (request.chatProvider as Record<string, unknown>).provider === 'openai'
+    ))).toBe(true);
+    expect(memoryRequests.every((request) => !('byokChatProvider' in request))).toBe(true);
+  });
+
+  it('uses the shared memory payload for the daemon-backed BYOK route', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
+    vi.stubGlobal('fetch', fetchMock);
+    mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
+      options.handlers.onDelta('hello');
+      options.handlers.onDone('hello');
+    });
+    renderProjectView();
+
+    await sendTestPrompt();
+
+    await waitFor(() => expect(mockedStreamViaDaemon).toHaveBeenCalledTimes(1));
+    const memoryRequest = fetchMock.mock.calls.find(([url]) => url === '/api/memory/extract');
+    expect(memoryRequest).toBeTruthy();
+    const body = JSON.parse(String((memoryRequest?.[1] as RequestInit).body)) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      chatProvider: {
+        provider: 'openai',
+        model: 'deepseek-chat',
+      },
+    });
+    expect(body).not.toHaveProperty('byokChatProvider');
+  });
+
+  it('records an empty direct API completion as failed', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
+    vi.stubGlobal('fetch', fetchMock);
+    mockedStreamMessage.mockImplementation(async (_config, _system, _history, _signal, handlers) => {
+      handlers.onDone('');
+    });
+    renderProjectView(project, [
+      {
+        id: 'byok-opencode',
+        name: 'BYOK OpenCode',
+        bin: 'opencode',
+        available: false,
+        models: [],
+      } as AgentInfo,
+    ]);
+
+    await sendTestPrompt();
+
+    await waitFor(() => expect(mockedTrackRunFinished).toHaveBeenCalledTimes(1));
+    expect(mockedTrackRunFinished.mock.calls[0]?.[1]).toMatchObject({
+      result: 'failed',
+      artifact_count: 0,
+    });
+    expect(screen.getByText('empty_response:deepseek-chat')).toBeTruthy();
+  });
+
+  it('records a stopped direct API run as cancelled after the provider settles', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
+    vi.stubGlobal('fetch', fetchMock);
+    let releaseProvider: (() => void) | undefined;
+    let providerSignal: AbortSignal | undefined;
+    const providerSettled = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    mockedStreamMessage.mockImplementation(async (_config, _system, _history, signal) => {
+      providerSignal = signal;
+      await providerSettled;
+    });
+    renderProjectView(project, [
+      {
+        id: 'byok-opencode',
+        name: 'BYOK OpenCode',
+        bin: 'opencode',
+        available: false,
+        models: [],
+      } as AgentInfo,
+    ]);
+
+    await sendTestPrompt();
+    await waitFor(() => expect(mockedStreamMessage).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole('button', { name: 'stop' }));
+    await waitFor(() => expect(providerSignal?.aborted).toBe(true));
+    releaseProvider?.();
+
+    await waitFor(() => expect(mockedTrackRunFinished).toHaveBeenCalledTimes(1));
+    expect(mockedTrackRunFinished.mock.calls[0]?.[1]).toMatchObject({
+      result: 'cancelled',
+      artifact_count: 0,
+    });
+    expect(screen.getByText('canceled')).toBeTruthy();
+  });
+
+  it('ignores a late provider callback after the direct API run is terminal', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
+    vi.stubGlobal('fetch', fetchMock);
+    mockedStreamMessage.mockImplementation(async (_config, _system, _history, _signal, handlers) => {
+      handlers.onDelta('hello');
+      handlers.onDone('hello');
+      handlers.onError(new Error('late provider error'));
+    });
+    renderProjectView(project, [
+      {
+        id: 'byok-opencode',
+        name: 'BYOK OpenCode',
+        bin: 'opencode',
+        available: false,
+        models: [],
+      } as AgentInfo,
+    ]);
+
+    await sendTestPrompt();
+
+    await waitFor(() => expect(mockedTrackRunFinished).toHaveBeenCalledTimes(1));
+    expect(mockedTrackRunFinished.mock.calls[0]?.[1]).toMatchObject({ result: 'success' });
+    expect(screen.queryByText('late provider error')).toBeNull();
   });
 
   it('does not include saved project instructions in the BYOK system prompt', async () => {
