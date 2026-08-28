@@ -301,12 +301,13 @@ function renderProjectView(
       models: [],
     } as AgentInfo,
   ],
+  renderConfig: AppConfig = config,
 ) {
   return render(
     <ProjectView
       project={renderProject}
       routeFileName={null}
-      config={config}
+      config={renderConfig}
       agents={agents}
       skills={[] as SkillSummary[]}
       designTemplates={[] as SkillSummary[]}
@@ -674,6 +675,41 @@ describe('ProjectView API empty response handling', () => {
     ))).toBe(true);
     expect(memoryRequests.every((request) => !('byokChatProvider' in request))).toBe(true);
   });
+
+  it.each(['senseaudio', 'aihubmix'] as const)(
+    'omits unsupported %s chat protocols from memory extraction payloads',
+    async (apiProtocol) => {
+      const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
+      vi.stubGlobal('fetch', fetchMock);
+      mockedStreamMessage.mockImplementation(async (_config, _system, _history, _signal, handlers) => {
+        handlers.onDone('hello');
+      });
+      renderProjectView(
+        project,
+        [
+          {
+            id: 'byok-opencode',
+            name: 'BYOK OpenCode',
+            bin: 'opencode',
+            available: false,
+            models: [],
+          } as AgentInfo,
+        ],
+        { ...config, apiProtocol },
+      );
+
+      await sendTestPrompt();
+
+      await waitFor(() => expect(mockedStreamMessage).toHaveBeenCalledTimes(1));
+      await waitFor(() => {
+        expect(fetchMock.mock.calls.filter(([url]) => url === '/api/memory/extract')).toHaveLength(2);
+      });
+      const memoryRequests = fetchMock.mock.calls
+        .filter(([url]) => url === '/api/memory/extract')
+        .map(([, init]) => JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>);
+      expect(memoryRequests.every((request) => !('chatProvider' in request))).toBe(true);
+    },
+  );
 
   it('uses the shared memory payload for the daemon-backed BYOK route', async () => {
     const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
