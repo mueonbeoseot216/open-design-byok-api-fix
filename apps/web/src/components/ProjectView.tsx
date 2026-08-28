@@ -113,10 +113,12 @@ import {
   trackRunRecoveryActionClick,
   trackRunStartBlockedSurfaceView,
 } from '../analytics/events';
+import type { Track } from '../analytics/events';
 import {
   buildByokRunCreatedProps,
   buildByokRunFinishedProps,
   byokSessionModeForTracking,
+  type ByokRunBaseInput,
 } from '../analytics/byok-run';
 import { byokPreflightBlockReason } from './byok/preflight';
 import {
@@ -1087,6 +1089,30 @@ function historyWithWorkspaceContext(
   );
 }
 
+async function historyForByokRun(input: {
+  history: ChatMessage[];
+  userMessageId: string;
+  runContext: ChatSendMeta['context'] | undefined;
+  projectId: string;
+  projectFiles: ProjectFile[];
+  omitNativeImageAttachments: boolean;
+  workspaceContext: WorkspaceCollabContext | null;
+}): Promise<ChatMessage[]> {
+  return historyWithApiAttachmentContext(
+    historyWithCommentAttachmentContext(
+      historyWithWorkspaceContext(input.history, input.userMessageId, input.runContext),
+      input.userMessageId,
+    ),
+    input.userMessageId,
+    input.projectId,
+    input.projectFiles,
+    {
+      omitNativeImageAttachments: input.omitNativeImageAttachments,
+      workspaceContext: input.workspaceContext,
+    },
+  );
+}
+
 function commentTaskQuery(attachment: ChatCommentAttachment): string {
   return (attachment.comment ?? '').trim();
 }
@@ -1727,6 +1753,184 @@ function isOpenCodeByokChatProtocol(
     protocol === 'senseaudio' ||
     protocol === 'aihubmix'
   );
+}
+
+type ByokMemoryChatProvider = {
+  provider: ByokChatProtocol;
+  apiKey: string;
+  baseUrl: string;
+  apiVersion: string;
+  model: string;
+};
+
+function byokMemoryChatProviderFromConfig(
+  config: AppConfig,
+): ByokMemoryChatProvider | undefined {
+  if (!isOpenCodeByokChatProtocol(config.apiProtocol) || !config.apiKey) {
+    return undefined;
+  }
+  return {
+    provider: config.apiProtocol,
+    apiKey: config.apiKey,
+    baseUrl: config.baseUrl,
+    apiVersion: config.apiProtocol === 'azure' ? config.apiVersion ?? '' : '',
+    model: config.model,
+  };
+}
+
+function byokMemoryChatProviderFromOpenCodeProvider(
+  provider: ByokChatProviderConfig | undefined,
+): ByokMemoryChatProvider | undefined {
+  if (!provider) return undefined;
+  return {
+    provider: provider.protocol,
+    apiKey: provider.apiKey,
+    baseUrl: provider.baseUrl ?? '',
+    apiVersion: provider.apiVersion ?? '',
+    model: provider.model ?? '',
+  };
+}
+
+async function postByokMemoryExtraction(input: {
+  userMessage: string;
+  assistantMessage?: string;
+  projectId: string;
+  conversationId: string;
+  chatProvider?: ByokMemoryChatProvider;
+}): Promise<void> {
+  if (input.userMessage.length === 0) return;
+  try {
+    await fetch('/api/memory/extract', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userMessage: input.userMessage,
+        ...(input.assistantMessage ? { assistantMessage: input.assistantMessage } : {}),
+        projectId: input.projectId,
+        conversationId: input.conversationId,
+        chatProvider: input.chatProvider,
+      }),
+    });
+  } catch {
+    // Memory extraction is best-effort and must never block a chat run.
+  }
+}
+
+type DirectByokStreamHandlers = {
+  onDelta: (textDelta: string) => void;
+  onAgentEvent: (event: AgentEvent) => void;
+  onDone: (fullText: string) => void | Promise<void>;
+  onError: (error: Error) => void | Promise<void>;
+};
+
+type DirectByokRunResult = 'success' | 'failed' | 'cancelled';
+
+async function streamDirectByokRun(input: {
+  config: AppConfig;
+  systemPrompt: string;
+  history: ChatMessage[];
+  signal: AbortSignal;
+  context?: Parameters<typeof streamMessage>[5];
+  handlers: DirectByokStreamHandlers;
+  userText: string;
+  projectId: string;
+  conversationId: string;
+  chatProvider?: ByokMemoryChatProvider;
+  track: Track;
+  runBase: ByokRunBaseInput;
+  startedAt: number;
+  countProducedArtifacts: () => Promise<number>;
+}): Promise<void> {
+  let accumulatedAssistantText = '';
+  let terminal: { result: DirectByokRunResult; text: string } | null = null;
+  let analyticsFinished = false;
+
+  const emitRunFinished = (
+    result: DirectByokRunResult,
+    artifactCount: number,
+  ): void => {
+    if (analyticsFinished) return;
+    analyticsFinished = true;
+    trackRunFinished(
+      input.track,
+      buildByokRunFinishedProps({
+        ...input.runBase,
+        result,
+        artifactCount,
+        askedUserQuestion: (terminal?.text ?? accumulatedAssistantText).includes('<question-form'),
+        totalDurationMs: Math.max(0, Date.now() - input.startedAt),
+      }),
+    );
+  };
+
+  const acceptDone = (fullText = ''): void => {
+    if (terminal) return;
+    const text = fullText.trim().length > 0 ? fullText : accumulatedAssistantText;
+    terminal = {
+      result: text.trim().length > 0 ? 'success' : 'failed',
+      text,
+    };
+    input.handlers.onDone(text);
+  };
+
+  const acceptError = (error: Error): void => {
+    if (terminal) return;
+    const result = input.signal.aborted || error.name === 'AbortError'
+      ? 'cancelled'
+      : 'failed';
+    terminal = { result, text: accumulatedAssistantText };
+    if (result === 'failed') void input.handlers.onError(error);
+  };
+
+  try {
+    await streamMessage(
+      input.config,
+      input.systemPrompt,
+      input.history,
+      input.signal,
+      {
+        onDelta: (delta) => {
+          if (terminal) return;
+          accumulatedAssistantText += delta;
+          input.handlers.onDelta(delta);
+          input.handlers.onAgentEvent({ kind: 'text', text: delta });
+        },
+        onDone: acceptDone,
+        onError: acceptError,
+      },
+      input.context,
+    );
+  } catch (error) {
+    acceptError(error instanceof Error ? error : new Error(String(error)));
+  }
+
+  if (!terminal) {
+    if (input.signal.aborted) {
+      terminal = { result: 'cancelled', text: accumulatedAssistantText };
+    } else {
+      // A provider that resolves without a terminal callback is still a
+      // completed provider operation. Feed the accumulated text through the
+      // normal UI finalizer so an empty operation becomes failed, not success.
+      acceptDone(accumulatedAssistantText);
+    }
+  }
+
+  if (!terminal) return;
+  if (terminal.result === 'success') {
+    const artifactCount = await input.countProducedArtifacts().catch(() => 0);
+    emitRunFinished('success', artifactCount);
+    if (terminal.text.trim().length > 0) {
+      void postByokMemoryExtraction({
+        userMessage: input.userText,
+        assistantMessage: terminal.text,
+        projectId: input.projectId,
+        conversationId: input.conversationId,
+        chatProvider: input.chatProvider,
+      });
+    }
+    return;
+  }
+  emitRunFinished(terminal.result, 0);
 }
 
 function projectEventToAgentEvent(evt: ProjectEvent): LiveArtifactEventItem['event'] | null {
@@ -8505,55 +8709,29 @@ export function ProjectView({
           // those users retain tool execution, but use the browser-side
           // provider path as the API-only fallback when it is not installed.
           const userText = (userMsg.content ?? '').trim();
-          const chatProvider =
-            config.apiProtocol && config.apiKey
-              ? {
-                  provider: config.apiProtocol,
-                  apiKey: config.apiKey,
-                  baseUrl: config.baseUrl,
-                  apiVersion:
-                    config.apiProtocol === 'azure'
-                      ? config.apiVersion ?? ''
-                      : '',
-                  model: config.model,
-                }
-              : undefined;
-          if (userText.length > 0) {
-            try {
-              await fetch('/api/memory/extract', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  userMessage: userText,
-                  projectId: project.id,
-                  conversationId: runConversationId,
-                  chatProvider,
-                }),
-              });
-            } catch {
-              // Best-effort: memory extraction must never block the chat.
-            }
-          }
+          const chatProvider = byokMemoryChatProviderFromConfig(config);
+          await postByokMemoryExtraction({
+            userMessage: userText,
+            projectId: project.id,
+            conversationId: runConversationId,
+            chatProvider,
+          });
           const systemPrompt = await composedSystemPrompt(runSessionMode);
-          const apiHistory = await historyWithApiAttachmentContext(
-            historyWithCommentAttachmentContext(
-              historyWithWorkspaceContext(nextHistory, userMsg.id, runContext),
-              userMsg.id,
-            ),
-            userMsg.id,
-            project.id,
+          const apiHistory = await historyForByokRun({
+            history: nextHistory,
+            userMessageId: userMsg.id,
+            runContext,
+            projectId: project.id,
             projectFiles,
-            {
-              omitNativeImageAttachments: usesAnthropicProxy(config),
-              workspaceContext: projectRunWorkspaceContext,
-            },
-          );
+            omitNativeImageAttachments: usesAnthropicProxy(config),
+            workspaceContext: projectRunWorkspaceContext,
+          });
           pushEvent({ kind: 'status', label: 'requesting', detail: config.model });
 
           // Direct API runs do not reach the daemon, so emit their lifecycle
           // events client-side just as the historical direct path did.
           const byokRunId = randomUUID();
-          const byokRunBase = {
+          const byokRunBase: ByokRunBaseInput = {
             projectId: project.id,
             conversationId: runConversationId,
             runId: byokRunId,
@@ -8570,76 +8748,35 @@ export function ProjectView({
             ),
           };
           trackRunCreated(analytics.track, buildByokRunCreatedProps(byokRunBase));
-          const byokRunStartedAt = startedAt;
-          let accumulatedAssistantText = '';
-          let byokRunFinished = false;
-          const emitByokRunFinished = (
-            result: 'success' | 'failed' | 'cancelled',
-            artifactCount: number,
-          ): void => {
-            if (byokRunFinished) return;
-            byokRunFinished = true;
-            trackRunFinished(
-              analytics.track,
-              buildByokRunFinishedProps({
-                ...byokRunBase,
-                result,
-                artifactCount,
-                askedUserQuestion: accumulatedAssistantText.includes('<question-form'),
-                totalDurationMs: Math.max(0, Date.now() - byokRunStartedAt),
-              }),
-            );
-          };
-
-          void streamMessage(config, systemPrompt, apiHistory, controller.signal, {
-            onDelta: (delta) => {
-              accumulatedAssistantText += delta;
-              handlers.onDelta(delta);
-              handlers.onAgentEvent({ kind: 'text', text: delta });
-            },
-            onDone: (fullText) => {
-              const assistantText = (fullText || accumulatedAssistantText).trim();
-              handlers.onDone(fullText || accumulatedAssistantText);
-              void (async () => {
-                let artifactCount = 0;
-                try {
-                  const files = await refreshProjectFiles();
-                  artifactCount = (computeProducedFiles(beforeFileNames, files) ?? []).filter(
-                    (file) => Boolean(file.artifactManifest),
-                  ).length;
-                } catch {
-                  // A file refresh failure must not leave the run unfinished.
-                }
-                emitByokRunFinished('success', artifactCount);
-              })();
-              if (userText.length === 0 || assistantText.length === 0) return;
-              void fetch('/api/memory/extract', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  userMessage: userText,
-                  assistantMessage: accumulatedAssistantText,
-                  projectId: project.id,
-                  conversationId: runConversationId,
-                  chatProvider,
-                }),
-              }).catch(() => {
-                // Best-effort: see the pre-turn memory extraction above.
-              });
-            },
-            onError: (err) => {
-              handlers.onError(err);
-              emitByokRunFinished(controller.signal.aborted ? 'cancelled' : 'failed', 0);
-            },
-          }, {
+          void streamDirectByokRun({
+            config,
+            systemPrompt,
+            history: apiHistory,
+            signal: controller.signal,
+            handlers,
+            userText,
             projectId: project.id,
-            byokImageModel:
-              byokImageModelOverride || config.byokImageModel || byokImageModelOptionsPV[0]?.id,
-            byokVideoModel:
-              byokVideoModelOverride || config.byokVideoModel || byokVideoModelOptionsPV[0]?.id,
-            byokSpeechModel:
-              byokSpeechModelOverride || config.byokSpeechModel || byokSpeechModelOptionsPV[0]?.id,
-            byokSpeechVoice: byokSpeechVoiceOverride || config.byokSpeechVoice,
+            conversationId: runConversationId,
+            chatProvider,
+            track: analytics.track,
+            runBase: byokRunBase,
+            startedAt,
+            countProducedArtifacts: async () => {
+              const files = await refreshProjectFiles();
+              return (computeProducedFiles(beforeFileNames, files) ?? []).filter(
+                (file) => Boolean(file.artifactManifest),
+              ).length;
+            },
+            context: {
+              projectId: project.id,
+              byokImageModel:
+                byokImageModelOverride || config.byokImageModel || byokImageModelOptionsPV[0]?.id,
+              byokVideoModel:
+                byokVideoModelOverride || config.byokVideoModel || byokVideoModelOptionsPV[0]?.id,
+              byokSpeechModel:
+                byokSpeechModelOverride || config.byokSpeechModel || byokSpeechModelOptionsPV[0]?.id,
+              byokSpeechVoice: byokSpeechVoiceOverride || config.byokSpeechVoice,
+            },
           });
           return true;
         }
@@ -8658,47 +8795,25 @@ export function ProjectView({
         // Forward the per-call BYOK provider snapshot so "Same as chat"
         // memory extraction uses the same vendor, endpoint, key and model as
         // the run. The daemon consumes it for this request only.
-        const byokChatProvider = byokOpenCodeProvider
-          ? {
-              provider: byokOpenCodeProvider.protocol,
-              apiKey: byokOpenCodeProvider.apiKey,
-              baseUrl: byokOpenCodeProvider.baseUrl,
-              apiVersion: byokOpenCodeProvider.apiVersion,
-              model: byokOpenCodeProvider.model,
-            }
-          : undefined;
-        if (userText.length > 0) {
-          try {
-            await fetch('/api/memory/extract', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                userMessage: userText,
-                projectId: project.id,
-                conversationId: runConversationId,
-                byokChatProvider,
-              }),
-            });
-          } catch {
-            // Best-effort: memory extraction must never block the
-            // chat. The daemon's SSE bus will catch up the Memory tab
-            // on the next event.
-          }
-        }
-        pushEvent({ kind: 'status', label: 'requesting', detail: config.model });
-        const byokOpenCodeHistory = await historyWithApiAttachmentContext(
-          historyWithCommentAttachmentContext(
-            historyWithWorkspaceContext(nextHistory, userMsg.id, runContext),
-            userMsg.id,
-          ),
-          userMsg.id,
-          project.id,
-          projectFiles,
-          {
-            omitNativeImageAttachments: usesAnthropicProxy(config),
-            workspaceContext: projectRunWorkspaceContext,
-          },
+        const byokChatProvider = byokMemoryChatProviderFromOpenCodeProvider(
+          byokOpenCodeProvider,
         );
+        await postByokMemoryExtraction({
+          userMessage: userText,
+          projectId: project.id,
+          conversationId: runConversationId,
+          chatProvider: byokChatProvider,
+        });
+        pushEvent({ kind: 'status', label: 'requesting', detail: config.model });
+        const byokOpenCodeHistory = await historyForByokRun({
+          history: nextHistory,
+          userMessageId: userMsg.id,
+          runContext,
+          projectId: project.id,
+          projectFiles,
+          omitNativeImageAttachments: usesAnthropicProxy(config),
+          workspaceContext: projectRunWorkspaceContext,
+        });
         // Session-dimension hints on the BYOK-OpenCode path too, so
         // run_created / run_finished carry the same session-global and
         // project-scoped run sequence on every runtime (cli / amr / byok).
